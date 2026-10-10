@@ -1,0 +1,299 @@
+/*
+ * apriori.c : the Apriori algorithm, step by step, in plain C
+ *
+ * Usage  : ./apriori [baskets.csv] [min_sup] [min_conf] [dump_prefix]
+ *          baskets.csv : one transaction per line, items separated by commas
+ *          (with no arguments a built-in grocery dataset is used,
+ *           min_sup = 0.30, min_conf = 0.70)
+ * Compile: gcc -O2 -o apriori apriori.c
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+typedef unsigned long long M;                 /* an itemset = bitmask of item ids */
+#define MAXT 5000
+#define MAXI 64
+#define MAXS 100000
+#define MAXR 200000
+#define SHOWMAX 30
+
+static char raw[MAXT][256];
+static M    trans[MAXT];
+static int  nt = 0;
+static char items[MAXI][32];
+static int  ni = 0;
+
+static const char *builtin[] = {
+    "milk, bread, butter", "bread, butter", "milk, bread, eggs",
+    "milk, bread, butter, eggs", "beer, diapers, chips", "milk, diapers, beer",
+    "bread, butter, eggs", "milk, bread, butter", "beer, chips",
+    "milk, bread, butter, jam", NULL};
+
+/* ------------------------------ helpers ---------------------------------- */
+static int pop(M m)  { return __builtin_popcountll(m); }
+static int lowb(M m) { return __builtin_ctzll(m); }
+static int highb(M m){ return 63 - __builtin_clzll(m); }
+
+static const char *fmt(M m) {
+    static char buf[6][512]; static int k = 0;
+    char *b = buf[k = (k + 1) % 6]; b[0] = 0;
+    strcat(b, "{");
+    int first = 1;
+    for (int i = 0; i < ni; i++) if (m & (1ULL << i)) { if (!first) strcat(b, ", "); strcat(b, items[i]); first = 0; }
+    strcat(b, "}");
+    return b;
+}
+
+static int count_sup(M m) { int c = 0; for (int t = 0; t < nt; t++) if ((trans[t] & m) == m) c++; return c; }
+
+typedef struct { M m; int c; } IS;
+static int cmp_is(const void *a, const void *b) {
+    M x = ((const IS *)a)->m, y = ((const IS *)b)->m;
+    return (x > y) - (x < y);
+}
+static const IS *find(const IS *arr, int n, M m) {
+    IS key = {m, 0};
+    return bsearch(&key, arr, n, sizeof(IS), cmp_is);
+}
+
+static void trim_copy(char *dst, const char *src, int len) {
+    while (len > 0 && (*src == ' ' || *src == '\t')) { src++; len--; }
+    while (len > 0 && (src[len - 1] == ' ' || src[len - 1] == '\t' || src[len - 1] == '\r' || src[len - 1] == '\n')) len--;
+    if (len > 31) len = 31;
+    memcpy(dst, src, len); dst[len] = 0;
+}
+static int cmp_str(const void *a, const void *b) { return strcmp((const char *)a, (const char *)b); }
+
+/* split a line into item names, call fn for each */
+static int split(const char *line, char out[][32]) {
+    int k = 0; const char *p = line;
+    while (*p) {
+        const char *q = strchr(p, ',');
+        int len = q ? (int)(q - p) : (int)strlen(p);
+        char tmp[32]; trim_copy(tmp, p, len);
+        if (tmp[0] && k < MAXI) strcpy(out[k++], tmp);
+        if (!q) break;
+        p = q + 1;
+    }
+    return k;
+}
+
+static void build_items(void) {
+    static char all[MAXT * 8][32]; int na = 0;
+    for (int t = 0; t < nt; t++) {
+        char tok[MAXI][32]; int k = split(raw[t], tok);
+        for (int j = 0; j < k; j++) {
+            int seen = 0;
+            for (int q = 0; q < na; q++) if (!strcmp(all[q], tok[j])) { seen = 1; break; }
+            if (!seen && na < MAXT * 8) strcpy(all[na++], tok[j]);
+        }
+    }
+    qsort(all, na, 32, cmp_str);                          /* ids in alphabetical order */
+    ni = na > MAXI ? MAXI : na;
+    for (int i = 0; i < ni; i++) strcpy(items[i], all[i]);
+    for (int t = 0; t < nt; t++) {
+        char tok[MAXI][32]; int k = split(raw[t], tok);
+        trans[t] = 0;
+        for (int j = 0; j < k; j++)
+            for (int i = 0; i < ni; i++) if (!strcmp(items[i], tok[j])) trans[t] |= 1ULL << i;
+    }
+}
+
+/* join step: two k-1 itemsets are joinable when they differ in exactly one
+ * item each AND share their first k-2 items (every shared item is smaller
+ * than both differing items). This generates each candidate exactly once. */
+static int join_ok(M a, M b) {
+    M d = a ^ b, common = a & b;
+    if (pop(d) != 2) return 0;
+    return common == 0 || highb(common) < lowb(d);
+}
+
+/* ------------------------------- rules ----------------------------------- */
+typedef struct { M a, c; double sup, conf, lift; } Rule;
+static Rule rules[MAXR]; static int nr = 0;
+static int cmp_rule(const void *p, const void *q) {
+    const Rule *x = p, *y = q;
+    if (y->lift > x->lift + 1e-9) return 1;
+    if (x->lift > y->lift + 1e-9) return -1;
+    if (y->conf > x->conf + 1e-9) return 1;
+    if (x->conf > y->conf + 1e-9) return -1;
+    if (y->sup > x->sup + 1e-9) return 1;
+    if (x->sup > y->sup + 1e-9) return -1;
+    return (x->a > y->a) - (x->a < y->a);
+}
+
+static IS freq[MAXS]; static int nfreq = 0;
+
+int main(int argc, char **argv) {
+    const char *file = argc > 1 ? argv[1] : NULL;
+    double min_sup = argc > 2 ? atof(argv[2]) : 0.30;
+    double min_conf = argc > 3 ? atof(argv[3]) : 0.70;
+    const char *dump = argc > 4 ? argv[4] : NULL;
+
+    if (file && strcmp(file, "-")) {
+        FILE *f = fopen(file, "r");
+        if (!f) { fprintf(stderr, "Cannot open %s\n", file); return 1; }
+        while (nt < MAXT && fgets(raw[nt], sizeof raw[0], f)) if (strlen(raw[nt]) > 1) nt++;
+        fclose(f);
+    } else {
+        for (int i = 0; builtin[i]; i++) strcpy(raw[nt++], builtin[i]);
+    }
+    build_items();
+    int N = nt;
+    int minc = (int)ceil(min_sup * N - 1e-9);
+
+    /* ------------------------------------------------------------------ */
+    printf("=========== Apriori: step by step ===========\n\n");
+    printf("Transactions (%d) and items (%d: ", N, ni);
+    for (int i = 0; i < ni; i++) printf("%s%s", items[i], i + 1 < ni ? ", " : "");
+    printf(")\n");
+    for (int t = 0; t < N && t < 15; t++) printf("  T%-2d %s\n", t + 1, fmt(trans[t]));
+    if (N > 15) printf("  ... (%d more)\n", N - 15);
+
+    printf("\nStep 1  Thresholds: min_sup = %.2f (count >= %d of %d), min_conf = %.2f\n", min_sup, minc, N, min_conf);
+
+    /* Step 2: frequent 1-itemsets */
+    printf("\nStep 2  Frequent 1-itemsets (L1)\n");
+    IS cur[MAXS], nxt[MAXS]; int ncur = 0, nn;
+    int total_counted = 0, level_n[MAXI + 1] = {0}, scans = 1;
+    for (int i = 0; i < ni; i++) {
+        int c = count_sup(1ULL << i); total_counted++;
+        printf("  %-12s count %2d  support %.2f  %s\n", fmt(1ULL << i), c, (double)c / N, c >= minc ? "frequent" : "infrequent -> dropped");
+        if (c >= minc) cur[ncur++] = (IS){1ULL << i, c};
+    }
+    qsort(cur, ncur, sizeof(IS), cmp_is);
+    level_n[1] = ncur;
+    memcpy(freq, cur, ncur * sizeof(IS)); nfreq = ncur;
+
+    /* Steps 3-7: iterate */
+    int k;
+    for (k = 2; ncur > 1; k++) {
+        int njoin = 0, npruned = 0, ncounted = 0; nn = 0;
+        printf("\nIteration k = %d\n", k);
+        printf("Step 3  Join: combine frequent %d-itemsets that share their first %d item(s)\n", k - 1, k - 2);
+        printf("Step 4  Prune: drop candidates that have an infrequent %d-subset\n", k - 1);
+        int shown = 0;
+        IS keep[MAXS]; int nkeep = 0;
+        for (int i = 0; i < ncur; i++)
+            for (int j = i + 1; j < ncur; j++) {
+                if (!join_ok(cur[i].m, cur[j].m)) continue;
+                M u = cur[i].m | cur[j].m;
+                njoin++;
+                M missing = 0;
+                for (int b = 0; b < ni; b++) {
+                    if (!(u & (1ULL << b))) continue;
+                    M sub = u & ~(1ULL << b);
+                    if (!find(cur, ncur, sub)) { missing = sub; break; }
+                }
+                if (missing) {
+                    npruned++;
+                    if (shown++ < SHOWMAX) printf("    pruned %s : subset %s is not frequent (Apriori property)\n", fmt(u), fmt(missing));
+                    continue;
+                }
+                keep[nkeep++] = (IS){u, 0};
+            }
+        printf("        candidates after join: %d, pruned: %d, left to count: %d\n", njoin, npruned, nkeep);
+        printf("Step 5  Count support with one pass over the database\n");
+        scans++;
+        for (int q = 0; q < nkeep; q++) {
+            keep[q].c = count_sup(keep[q].m); ncounted++; total_counted++;
+            if (keep[q].c >= minc) nxt[nn++] = keep[q];
+        }
+        printf("Step 6  Keep candidates with count >= %d  ->  L%d has %d itemset(s)\n", minc, k, nn);
+        qsort(nxt, nn, sizeof(IS), cmp_is);
+        for (int q = 0; q < nn && q < SHOWMAX; q++) printf("    %-28s count %2d  support %.2f\n", fmt(nxt[q].m), nxt[q].c, (double)nxt[q].c / N);
+        if (nkeep - nn > 0) printf("    (%d counted candidate(s) fell below min_sup)\n", nkeep - nn);
+        (void)ncounted;
+        level_n[k] = nn;
+        if (nn == 0) { printf("Step 7  No new frequent itemsets: stop.\n"); break; }
+        memcpy(freq + nfreq, nxt, nn * sizeof(IS)); nfreq += nn;
+        memcpy(cur, nxt, nn * sizeof(IS)); ncur = nn;
+    }
+    if (ncur <= 1 && level_n[k] != 0) printf("\nStep 7  Fewer than 2 frequent itemsets left: stop.\n");
+
+    qsort(freq, nfreq, sizeof(IS), cmp_is);
+
+    printf("\n--- Frequent itemsets: %d in total (", nfreq);
+    for (int s = 1; s < MAXI && level_n[s]; s++) printf("%sL%d = %d", s > 1 ? ", " : "", s, level_n[s]);
+    printf(") ---\n");
+    printf("Support counted for %d itemsets, versus %.0f possible non-empty itemsets (2^%d - 1).\n",
+           total_counted, pow(2, ni) - 1, ni);
+    printf("Database passes: %d (one per level).\n", scans);
+
+    /* verification by brute force */
+    if (ni <= 24) {
+        int ok = 1, nbf = 0;
+        for (M m = 1; m < (1ULL << ni); m++) {
+            int c = count_sup(m);
+            if (c >= minc) { nbf++; const IS *f = find(freq, nfreq, m); if (!f || f->c != c) ok = 0; }
+        }
+        if (nbf != nfreq) ok = 0;
+        printf("Check: brute-force enumeration of all %.0f itemsets finds %d frequent itemsets -> %s\n",
+               pow(2, ni) - 1, nbf, ok ? "identical to Apriori's result" : "MISMATCH");
+    }
+
+    /* Step 8: rules */
+    for (int f = 0; f < nfreq; f++) {
+        M s = freq[f].m;
+        if (pop(s) < 2) continue;
+        for (M a = (s - 1) & s; a; a = (a - 1) & s) {
+            M c = s & ~a;
+            const IS *fa = find(freq, nfreq, a), *fc = find(freq, nfreq, c);
+            if (!fa || !fc) continue;                          /* cannot happen: Apriori property */
+            double conf = (double)freq[f].c / fa->c;
+            if (conf + 1e-9 < min_conf) continue;
+            if (nr < MAXR) rules[nr++] = (Rule){a, c, (double)freq[f].c / N, conf, conf / ((double)fc->c / N)};
+        }
+    }
+    qsort(rules, nr, sizeof(Rule), cmp_rule);
+    int pos = 0, neg = 0, ind = 0;
+    for (int i = 0; i < nr; i++) { if (rules[i].lift > 1 + 1e-9) pos++; else if (rules[i].lift < 1 - 1e-9) neg++; else ind++; }
+
+    printf("\nStep 8  Association rules with confidence >= %.2f: %d found\n", min_conf, nr);
+    printf("        (%d with lift > 1, %d with lift = 1, %d with lift < 1)\n\n", pos, ind, neg);
+    printf("%-34s %7s %7s %6s  %s\n", "Rule  X ==> Y", "support", "conf", "lift", "association");
+    for (int i = 0; i < nr && i < 25; i++) {
+        char left[300]; snprintf(left, sizeof left, "%s", fmt(rules[i].a));
+        char line[700]; snprintf(line, sizeof line, "%s ==> %s", left, fmt(rules[i].c));
+        printf("%-34s %7.2f %7.2f %6.2f  %s\n", line, rules[i].sup, rules[i].conf, rules[i].lift,
+               rules[i].lift > 1 + 1e-9 ? "positive" : (rules[i].lift < 1 - 1e-9 ? "negative" : "independent"));
+    }
+    if (nr > 25) printf("... (%d more rules)\n", nr - 25);
+
+    if (nr) {
+        const Rule *r = &rules[0];
+        const IS *fall = find(freq, nfreq, r->a | r->c), *fa = find(freq, nfreq, r->a), *fc = find(freq, nfreq, r->c);
+        printf("\nWorked example, top rule %s ==> %s:\n", fmt(r->a), fmt(r->c));
+        printf("  support    = count(X u Y) / N      = %d / %d = %.3f\n", fall->c, N, (double)fall->c / N);
+        printf("  confidence = sup(X u Y) / sup(X)   = %d / %d = %.3f\n", fall->c, fa->c, (double)fall->c / fa->c);
+        printf("  lift       = confidence / sup(Y)   = %.3f / %.3f = %.3f\n", (double)fall->c / fa->c, (double)fc->c / N, r->lift);
+    }
+
+    if (dump) {
+        char path[300]; FILE *f;
+        snprintf(path, sizeof path, "%s_itemsets.csv", dump);
+        if ((f = fopen(path, "w"))) {
+            for (int i = 0; i < nfreq; i++) {
+                int first = 1;
+                for (int b = 0; b < ni; b++) if (freq[i].m & (1ULL << b)) { fprintf(f, "%s%s", first ? "" : "|", items[b]); first = 0; }
+                fprintf(f, ",%d\n", freq[i].c);
+            }
+            fclose(f);
+        }
+        snprintf(path, sizeof path, "%s_rules.csv", dump);
+        if ((f = fopen(path, "w"))) {
+            for (int i = 0; i < nr; i++) {
+                int first = 1;
+                for (int b = 0; b < ni; b++) if (rules[i].a & (1ULL << b)) { fprintf(f, "%s%s", first ? "" : "|", items[b]); first = 0; }
+                fprintf(f, ",");
+                first = 1;
+                for (int b = 0; b < ni; b++) if (rules[i].c & (1ULL << b)) { fprintf(f, "%s%s", first ? "" : "|", items[b]); first = 0; }
+                fprintf(f, ",%.6f,%.6f,%.6f\n", rules[i].sup, rules[i].conf, rules[i].lift);
+            }
+            fclose(f);
+        }
+    }
+    return 0;
+}
